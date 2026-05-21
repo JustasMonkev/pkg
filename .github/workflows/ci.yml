@@ -29,3 +29,31 @@ jobs:
         run: yarn lint
       - run: yarn build
       - run: yarn test
+
+  rust-port:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust-port
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt
+          rustup default 1.85.0
+      - uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust-port/target/
+          key: rust-port-${{ runner.os }}-${{ hashFiles('rust-port/Cargo.lock') }}
+      - run: cargo fmt --check
+      - run: cargo check --locked --all-targets --all-features
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo test --locked --doc --all-features
+      - run: RUSTDOCFLAGS=-Dwarnings cargo doc --locked --no-deps --all-features
+      - run: cargo bench --locked --bench packaging --no-run
