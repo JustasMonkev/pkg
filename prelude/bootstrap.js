@@ -1743,6 +1743,32 @@ function payloadFileSync(pointer) {
     return f;
   }
 
+  function packageJsonForInternalModuleRead(path_, content) {
+    if (path.basename(path_) !== 'package.json') return content;
+
+    let config;
+    try {
+      config = JSON.parse(content);
+    } catch (_) {
+      return content;
+    }
+
+    if (
+      typeof config.main !== 'string' ||
+      config.main === '' ||
+      !Object.prototype.hasOwnProperty.call(config, 'exports')
+    ) {
+      return content;
+    }
+
+    // pkg's walker follows the legacy `main` field. Node's `exports` resolver
+    // reads package metadata through this internal hook, so expose the same
+    // legacy surface to the resolver while preserving the original file bytes
+    // for userland fs reads.
+    delete config.exports;
+    return JSON.stringify(config);
+  }
+
   function findNativeAddonForInternalModuleStat(path_) {
     const fNative = findNativeAddonSyncUnderRequire(path_);
     if (!fNative) return -ENOENT;
@@ -1825,9 +1851,13 @@ function payloadFileSync(pointer) {
     if (!entityContent) {
       return returnArray ? [undefined, false] : undefined;
     }
+    const content = packageJsonForInternalModuleRead(
+      path_,
+      payloadFileSync(entityContent).toString()
+    );
     return returnArray
-      ? [payloadFileSync(entityContent).toString(), true]
-      : payloadFileSync(entityContent).toString();
+      ? [content, true]
+      : content;
   };
 
   fs.internalModuleReadFile = fs.internalModuleReadJSON;
@@ -1886,6 +1916,110 @@ function payloadFileSync(pointer) {
     }
     makeRequireFunction = im.makeRequireFunction;
     // TODO esm modules along with cjs
+  }
+
+  function isPathModuleRequest(request) {
+    return (
+      request.slice(0, 2) === './' ||
+      request.slice(0, 3) === '../' ||
+      request.slice(0, 2) === '.\\' ||
+      request.slice(0, 3) === '..\\' ||
+      path.isAbsolute(request)
+    );
+  }
+
+  function vfsHasFile(filename) {
+    const entity = findVirtualFileSystemEntry(filename);
+    if (!entity) return false;
+    return Boolean(entity[STORE_BLOB] || entity[STORE_CONTENT]);
+  }
+
+  function vfsHasDirectory(filename) {
+    const entity = findVirtualFileSystemEntry(filename);
+    if (!entity) return false;
+    return Boolean(entity[STORE_LINKS]);
+  }
+
+  function readVfsContent(filename) {
+    const entity = findVirtualFileSystemEntry(filename);
+    if (!entity || !entity[STORE_CONTENT]) return undefined;
+    return payloadFileSync(entity[STORE_CONTENT]).toString();
+  }
+
+  function resolveVfsFile(filename) {
+    if (vfsHasFile(filename)) return filename;
+
+    const extensions = ['.js', '.json', '.node'];
+    for (let i = 0; i < extensions.length; i += 1) {
+      const next = `${filename}${extensions[i]}`;
+      if (vfsHasFile(next)) return next;
+    }
+
+    return undefined;
+  }
+
+  function resolveVfsDirectory(filename) {
+    if (!vfsHasDirectory(filename)) return undefined;
+
+    const packageJson = path.join(filename, 'package.json');
+    const packageBody = readVfsContent(packageJson);
+    if (packageBody) {
+      try {
+        const config = JSON.parse(packageBody);
+        if (typeof config.main === 'string' && config.main !== '') {
+          const resolvedMain = resolveVfsPath(path.join(filename, config.main));
+          if (resolvedMain) return resolvedMain;
+        }
+      } catch (_) {
+        // Keep falling back to index resolution, matching Node's tolerance here.
+      }
+    }
+
+    return resolveVfsFile(path.join(filename, 'index'));
+  }
+
+  function resolveVfsPath(filename) {
+    return resolveVfsFile(filename) || resolveVfsDirectory(filename);
+  }
+
+  function packageRequestBase(request) {
+    const parts = request.split(/[\\/]/);
+    if (request[0] === '@' && parts.length >= 2) {
+      return `${parts[0]}/${parts[1]}`;
+    }
+    return parts[0];
+  }
+
+  function tryResolveVfsModule(request, parent) {
+    if (
+      typeof request !== 'string' ||
+      isPathModuleRequest(request) ||
+      !parent ||
+      !insideSnapshot(parent.filename)
+    ) {
+      return undefined;
+    }
+
+    let directory = path.dirname(parent.filename);
+    const packageBase = packageRequestBase(request);
+    const packageRemainder = request.slice(packageBase.length);
+
+    while (insideSnapshot(directory)) {
+      const candidate = path.join(
+        directory,
+        'node_modules',
+        packageBase,
+        packageRemainder
+      );
+      const resolved = resolveVfsPath(candidate);
+      if (resolved) return resolved;
+
+      const next = path.dirname(directory);
+      if (next === directory) break;
+      directory = next;
+    }
+
+    return undefined;
   }
 
   Module.prototype._compile = function _compile(content, filename_) {
@@ -1951,8 +2085,13 @@ function payloadFileSync(pointer) {
       const savePathCache = Module._pathCache;
       Module._pathCache = Object.create(null);
       try {
-        filename = ancestor._resolveFilename.apply(this, arguments);
-        flagWasOn = true;
+        try {
+          filename = ancestor._resolveFilename.apply(this, arguments);
+          flagWasOn = true;
+        } catch (_) {
+          filename = tryResolveVfsModule(arguments[0], arguments[1]);
+          if (!filename) throw error;
+        }
       } finally {
         Module._pathCache = savePathCache;
         FLAG_ENABLE_PROJECT = false;
